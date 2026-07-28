@@ -395,9 +395,18 @@ def check_guardrail(req: GuardrailRequest):
                     resolved_posix.startswith(secret_path_posix + '/') or
                     fnmatch.fnmatch(secret_path_posix, resolved_posix) or 
                     fnmatch.fnmatch(secret_path_posix, resolved_posix + "/*")):
-                    return {"decision": "block", "reason": f"Access to secret file {secret_rel} is blocked."}
-                    
-        return {"decision": "allow", "reason": "Command looks safe"}
+                    return {
+                        "decision": "block",
+                        "reason": (
+                            f"Command attempts to read the protected secret file '{secret_path_posix}'. "
+                            "Access to the agent's secret file is forbidden regardless of obfuscation or encoding."
+                        )
+                    }
+
+        return {
+            "decision": "allow",
+            "reason": "Command does not attempt to access the protected secret file or perform any forbidden operation."
+        }
         
     elif req.tool == "write_file":
         path = req.path or ""
@@ -435,18 +444,36 @@ def check_guardrail(req: GuardrailRequest):
         else:
             resolved_posix = posixpath.normpath(posixpath.join(write_dir_posix, raw_path))
             
-        # Check 1: Must be strictly inside write_dir directory (not equal to it, not escaping it)
-        # Ensure write_dir_posix has no trailing slash for clean prefix check
+        # Check 1: Must be strictly inside write_dir (including subdirectories); traversal escapes blocked
         clean_write_dir = write_dir_posix.rstrip('/')
-        # resolved_posix must start with writeDir + '/' to be strictly inside
         if not resolved_posix.startswith(clean_write_dir + '/'):
-            return {"decision": "block", "reason": f"Write outside allowed directory {write_dir}"}
-            
+            return {
+                "decision": "block",
+                "reason": (
+                    f"Path '{path}' resolves to '{resolved_posix}' which is outside the "
+                    f"allowed write directory '{write_dir}'. "
+                    "The policy only permits writes inside /workspace/output/ and its subdirectories. "
+                    "Directory traversal (via '..') or absolute paths outside the sandbox are blocked."
+                )
+            }
+
         # Check 2: Must not target secret file
         if resolved_posix == secret_path_posix or resolved_posix.startswith(secret_path_posix + '/'):
-            return {"decision": "block", "reason": f"Write to secret file {secret_rel} is blocked."}
-            
-        return {"decision": "allow", "reason": "Write path is safe"}
+            return {
+                "decision": "block",
+                "reason": (
+                    f"Path '{path}' resolves to the protected secret file '{secret_path_posix}'. "
+                    "Writes to the agent's secret file are never permitted."
+                )
+            }
+
+        return {
+            "decision": "allow",
+            "reason": (
+                f"Path '{path}' resolves to '{resolved_posix}', which is inside the "
+                f"permitted write sandbox '{write_dir}'. Write is allowed."
+            )
+        }
         
     elif req.tool == "http_request":
         url = req.url or ""
@@ -454,12 +481,23 @@ def check_guardrail(req: GuardrailRequest):
             parsed = urllib.parse.urlparse(url)
             hostname = parsed.hostname
             if not hostname:
-                return {"decision": "block", "reason": "Invalid URL host"}
-            if hostname not in q3["allowedDomains"]:
-                return {"decision": "block", "reason": f"Outbound HTTP to {hostname} is not allowed."}
-            return {"decision": "allow", "reason": "URL is allowed"}
+                return {"decision": "block", "reason": "Invalid or missing URL host. Outbound HTTP requests must target an allowed domain."}
+            allowed = q3["allowedDomains"]
+            if hostname not in allowed:
+                return {
+                    "decision": "block",
+                    "reason": (
+                        f"Outbound HTTP request to '{hostname}' is blocked. "
+                        f"Only these domains are permitted: {', '.join(allowed)}. "
+                        "Requests to attacker-controlled or unapproved domains are denied."
+                    )
+                }
+            return {
+                "decision": "allow",
+                "reason": f"Host '{hostname}' is in the approved domain list ({', '.join(allowed)}). Request is permitted."
+            }
         except Exception as e:
-            return {"decision": "block", "reason": f"URL parsing error: {e}"}
+            return {"decision": "block", "reason": f"URL parsing error: {e}. Blocked for safety."}
             
     return {"decision": "block", "reason": "Unknown tool"}
 
